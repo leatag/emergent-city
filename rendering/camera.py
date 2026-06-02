@@ -1,54 +1,80 @@
 """
-camera.py — Isometric camera. Handles pan/zoom and the tile↔screen mapping.
+camera.py — Simple top-down camera with pan, zoom, and tile<->screen transforms.
 """
 
 from __future__ import annotations
+from typing import Tuple
+
 import config
 
 
 class Camera:
-    def __init__(self) -> None:
-        self.x = 0.0
-        self.y = 0.0
-        self.zoom = 1.0
-        self.screen_w = config.SCREEN_WIDTH
-        self.screen_h = config.SCREEN_HEIGHT
+    """Pan, zoom, and project between tile coords and screen pixels."""
 
-    # ── Movement ──────────────────────────────────────────────────────────────
-    def pan(self, dx: float, dy: float) -> None:
-        self.x += dx / self.zoom
-        self.y += dy / self.zoom
+    def __init__(
+        self,
+        viewport_w: int,
+        viewport_h: int,
+        world_w_tiles: int,
+        world_h_tiles: int,
+    ) -> None:
+        self.screen_w = viewport_w
+        self.screen_h = viewport_h
+        self.world_w = world_w_tiles
+        self.world_h = world_h_tiles
+        # Position in tile coordinates of the tile shown at the screen center.
+        self.cx: float = world_w_tiles / 2.0
+        self.cy: float = world_h_tiles / 2.0
+        self.zoom: float = config.DEFAULT_ZOOM
 
-    def zoom_at(self, factor: float, sx: float, sy: float) -> None:
-        old_zoom = self.zoom
-        self.zoom = max(config.CAMERA_MIN_ZOOM,
-                        min(config.CAMERA_MAX_ZOOM, self.zoom * factor))
-        # Keep the point under the cursor stable
-        scale = self.zoom / old_zoom
-        self.x = sx - (sx - self.x) * scale
-        self.y = sy - (sy - self.y) * scale
+    # ── Pan / zoom ────────────────────────────────────────────────────────────
+    def pan(self, dx_pixels: float, dy_pixels: float) -> None:
+        """Pan the view by a pixel delta (positive dx moves the world right under mouse-drag math)."""
+        tw, th = self._tile_pixels()
+        if tw == 0 or th == 0:
+            return
+        self.cx += dx_pixels / tw
+        self.cy += dy_pixels / th
+        self._clamp()
 
-    def center_on(self, tx: int, ty: int) -> None:
-        sx, sy = self.tile_to_screen(tx, ty)
-        self.x += self.screen_w / 2 - sx
-        self.y += self.screen_h / 2 - sy
+    def zoom_at(self, screen_pos: Tuple[int, int], delta: float) -> None:
+        """Zoom toward a screen-space point by a multiplicative delta (e.g. +0.1)."""
+        old_tile = self.screen_to_tile(*screen_pos)
+        self.zoom = max(config.CAMERA_MIN_ZOOM, min(config.CAMERA_MAX_ZOOM, self.zoom + delta))
+        new_tile = self.screen_to_tile(*screen_pos)
+        # Keep the cursor on the same world tile after zoom
+        self.cx += old_tile[0] - new_tile[0]
+        self.cy += old_tile[1] - new_tile[1]
+        self._clamp()
 
-    # ── Transforms ────────────────────────────────────────────────────────────
-    def tile_to_screen(self, tx: float, ty: float) -> tuple:
-        tw = config.TILE_WIDTH * self.zoom
-        th = config.TILE_HEIGHT * self.zoom
-        sx = (tx - ty) * tw / 2 + self.x
-        sy = (tx + ty) * th / 2 + self.y
-        return sx, sy
-
-    def screen_to_tile(self, sx: float, sy: float) -> tuple:
-        tw = config.TILE_WIDTH * self.zoom
-        th = config.TILE_HEIGHT * self.zoom
-        sx -= self.x
-        sy -= self.y
-        tx = (sx / (tw / 2) + sy / (th / 2)) / 2
-        ty = (sy / (th / 2) - sx / (tw / 2)) / 2
-        return int(tx), int(ty)
+    def center_on(self, tile_x: float, tile_y: float) -> None:
+        self.cx = float(tile_x)
+        self.cy = float(tile_y)
+        self._clamp()
 
     def resize(self, w: int, h: int) -> None:
-        self.screen_w, self.screen_h = w, h
+        self.screen_w = w
+        self.screen_h = h
+
+    def _clamp(self) -> None:
+        # Allow some overscroll so edges are reachable
+        self.cx = max(0.0, min(float(self.world_w), self.cx))
+        self.cy = max(0.0, min(float(self.world_h), self.cy))
+
+    def _tile_pixels(self) -> Tuple[float, float]:
+        return config.TILE_WIDTH * self.zoom, config.TILE_HEIGHT * self.zoom
+
+    # ── Projection ────────────────────────────────────────────────────────────
+    def tile_to_screen(self, tile_x: float, tile_y: float) -> Tuple[float, float]:
+        tw, th = self._tile_pixels()
+        sx = self.screen_w / 2 + (tile_x - self.cx) * tw
+        sy = self.screen_h / 2 + (tile_y - self.cy) * th
+        return sx, sy
+
+    def screen_to_tile(self, sx: float, sy: float) -> Tuple[int, int]:
+        tw, th = self._tile_pixels()
+        if tw == 0 or th == 0:
+            return 0, 0
+        tx = self.cx + (sx - self.screen_w / 2) / tw
+        ty = self.cy + (sy - self.screen_h / 2) / th
+        return int(tx), int(ty)
