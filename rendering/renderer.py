@@ -1,134 +1,148 @@
 """
-renderer.py — Isometric tile, building, and agent rendering with depth sort
-and a day/night tint overlay. Pure pygame, no asset files — diamonds and
-quads only.
+renderer.py — Top-down 2D tile, building, and agent rendering with a
+day/night tint overlay. Pure pygame, no asset files.
+
+API:
+    r = Renderer(screen, world, camera)
+    r.draw()
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict
 
 import pygame
 
 import config
 from rendering.camera import Camera
 from rendering.lighting import tint_for_hour, building_window_alpha
-from world.tile import TileType
+from world.tile_map import TileType
+from world.buildings import BuildingType
 
 if TYPE_CHECKING:
     from world.world import World
 
 
-TILE_COLORS = {
-    TileType.GRASS:    (80, 130, 70),
-    TileType.DIRT:     (110, 85, 55),
-    TileType.ROAD:     (70, 70, 75),
-    TileType.WATER:    (50, 90, 140),
-    TileType.SAND:     (200, 180, 120),
-    TileType.STONE:    (110, 110, 115),
-    TileType.SIDEWALK: (140, 140, 140),
-    TileType.PARK:     (60, 110, 60),
+_TILE_COLORS: Dict[TileType, tuple] = {
+    TileType.GRASS:      config.PALETTE.grass,
+    TileType.GRASS_LUSH: config.PALETTE.grass_lush,
+    TileType.ROAD:       config.PALETTE.road,
+    TileType.SIDEWALK:   config.PALETTE.sidewalk,
+    TileType.WATER:      config.PALETTE.water,
+    TileType.PLAZA:      config.PALETTE.sidewalk,
+    TileType.DIRT:       (110, 85, 55),
+}
+
+_BUILDING_COLORS: Dict[BuildingType, tuple] = {
+    BuildingType.HOUSE:          config.PALETTE.house_wall,
+    BuildingType.HOUSE_WEALTHY:  config.PALETTE.house_wealthy_wall,
+    BuildingType.SHACK:          config.PALETTE.slum_wall,
+    BuildingType.SHOP:           config.PALETTE.shop_wall,
+    BuildingType.FACTORY:        config.PALETTE.factory_wall,
+    BuildingType.BAR:            (140, 90, 130),
+    BuildingType.PARK_BENCH:     (90, 60, 40),
+    BuildingType.CHURCH:         (180, 170, 200),
+    BuildingType.POLICE_STATION: (90, 110, 160),
 }
 
 
 class Renderer:
-    def __init__(self, screen: pygame.Surface) -> None:
+    def __init__(self, screen: pygame.Surface, world: "World", camera: Camera) -> None:
         self.screen = screen
-        self.font = pygame.font.SysFont("arial", 12)
+        self.world = world
+        self.camera = camera
         self.name_font = pygame.font.SysFont("arial", 10)
+        # Selected agent id is owned by the AgentPanel; renderer reads from world if needed.
+        self.selected_agent_id: int = -1
 
-    def render(self, world: "World", camera: Camera, selected_agent_id: int = -1) -> None:
-        self.screen.fill((20, 20, 28))
-        self._render_tiles(world, camera)
-        self._render_buildings(world, camera)
-        self._render_agents(world, camera, selected_agent_id)
-        self._render_tint(world)
+    # ── Public ────────────────────────────────────────────────────────────────
+    def draw(self) -> None:
+        self.screen.fill(config.PALETTE.background)
+        self._draw_tiles()
+        self._draw_buildings()
+        self._draw_agents()
+        self._draw_tint()
 
     # ── Tiles ─────────────────────────────────────────────────────────────────
-    def _render_tiles(self, world: "World", camera: Camera) -> None:
-        tm = world.tile_map
-        tw = config.TILE_WIDTH * camera.zoom
-        th = config.TILE_HEIGHT * camera.zoom
+    def _draw_tiles(self) -> None:
+        tm = self.world.tile_map
+        cam = self.camera
+        tw = config.TILE_WIDTH * cam.zoom
+        th = config.TILE_HEIGHT * cam.zoom
 
-        # Visible-tile culling
-        top_left = camera.screen_to_tile(0, 0)
-        bot_right = camera.screen_to_tile(camera.screen_w, camera.screen_h)
-        x0 = max(0, min(top_left[0], bot_right[0]) - 4)
-        y0 = max(0, min(top_left[1], bot_right[1]) - 4)
-        x1 = min(tm.width, max(top_left[0], bot_right[0]) + 4)
-        y1 = min(tm.height, max(top_left[1], bot_right[1]) + 4)
+        x0, y0 = cam.screen_to_tile(0, 0)
+        x1, y1 = cam.screen_to_tile(cam.screen_w, cam.screen_h)
+        x0 = max(0, min(x0, x1) - 1)
+        y0 = max(0, min(y0, y1) - 1)
+        x1 = min(tm.width, max(x0, x1) + 2)
+        y1 = min(tm.height, max(y0, y1) + 2)
 
         for x in range(x0, x1):
             for y in range(y0, y1):
                 t = tm.tiles[x][y]
-                sx, sy = camera.tile_to_screen(x, y)
-                color = TILE_COLORS.get(t.type, (100, 100, 100))
+                sx, sy = cam.tile_to_screen(x, y)
+                color = _TILE_COLORS.get(t.type, (100, 100, 100))
                 if t.danger > 0.05:
                     r, g, b = color
-                    color = (min(255, int(r + 80 * t.danger)),
-                             max(0, int(g - 60 * t.danger)),
-                             max(0, int(b - 60 * t.danger)))
-                pygame.draw.polygon(self.screen, color, [
-                    (sx,           sy + th / 2),
-                    (sx + tw / 2,  sy),
-                    (sx + tw,      sy + th / 2),
-                    (sx + tw / 2,  sy + th),
-                ])
+                    color = (
+                        min(255, int(r + 80 * t.danger)),
+                        max(0, int(g - 50 * t.danger)),
+                        max(0, int(b - 50 * t.danger)),
+                    )
+                pygame.draw.rect(self.screen, color, (int(sx), int(sy), int(tw) + 1, int(th) + 1))
 
     # ── Buildings ─────────────────────────────────────────────────────────────
-    def _render_buildings(self, world: "World", camera: Camera) -> None:
-        glow = building_window_alpha(world.time_system.hour_float)
-        for b in sorted(world.buildings.buildings, key=lambda b: (b.x + b.y)):
-            sx, sy = camera.tile_to_screen(b.x, b.y)
-            tw = config.TILE_WIDTH * camera.zoom
-            th = config.TILE_HEIGHT * camera.zoom
-            h = config.BUILDING_HEIGHT_PX * camera.zoom * b.size_modifier
-            top = [
-                (sx, sy + th * b.h / 2 - h),
-                (sx + tw * b.w / 2, sy - h),
-                (sx + tw * (b.w + b.h) / 2, sy + th * b.w / 2 - h),
-                (sx + tw * b.h / 2, sy + th * (b.w + b.h) / 2 - h),
-            ]
-            base_color = b.color
-            roof_color = tuple(min(255, c + 30) for c in base_color)
-            # Left wall
-            pygame.draw.polygon(self.screen, tuple(max(0, c - 40) for c in base_color), [
-                (sx, sy + th * b.h / 2),
-                (sx + tw * b.h / 2, sy + th * (b.w + b.h) / 2),
-                top[3], top[0],
-            ])
-            # Right wall
-            pygame.draw.polygon(self.screen, base_color, [
-                (sx + tw * b.h / 2, sy + th * (b.w + b.h) / 2),
-                (sx + tw * (b.w + b.h) / 2, sy + th * b.w / 2),
-                top[2], top[3],
-            ])
-            # Roof
-            pygame.draw.polygon(self.screen, roof_color, top)
+    def _draw_buildings(self) -> None:
+        cam = self.camera
+        tw = config.TILE_WIDTH * cam.zoom
+        th = config.TILE_HEIGHT * cam.zoom
+        glow = building_window_alpha(self.world.time_system.hour)
 
-            # Lit windows at night
-            if glow > 20:
-                col = (255, 220, 120, glow)
-                surf = pygame.Surface((6, 6), pygame.SRCALPHA)
-                pygame.draw.rect(surf, col, surf.get_rect())
-                self.screen.blit(surf, (top[3][0] + 4, top[3][1] + 4))
-                self.screen.blit(surf, (top[3][0] + 16, top[3][1] + 4))
+        for b in self.world.buildings.buildings:
+            sx, sy = cam.tile_to_screen(b.x, b.y)
+            w_px = int(tw * b.w)
+            h_px = int(th * b.h)
+            if w_px <= 0 or h_px <= 0:
+                continue
+            base = _BUILDING_COLORS.get(b.type, (140, 120, 100))
+            if b.on_fire:
+                base = (220, 80, 40)
+            # body
+            pygame.draw.rect(self.screen, base, (int(sx), int(sy), w_px, h_px))
+            # roof outline
+            roof = tuple(max(0, min(255, c + 25)) for c in base)
+            pygame.draw.rect(self.screen, roof, (int(sx), int(sy), w_px, h_px), 2)
+            # lit windows at night
+            if glow > 20 and w_px > 6 and h_px > 6:
+                win = (255, 220, 120)
+                pygame.draw.rect(self.screen, win, (int(sx) + 3, int(sy) + 3, 3, 3))
+                if w_px > 12:
+                    pygame.draw.rect(self.screen, win, (int(sx) + w_px - 6, int(sy) + 3, 3, 3))
+                if h_px > 12:
+                    pygame.draw.rect(self.screen, win, (int(sx) + 3, int(sy) + h_px - 6, 3, 3))
 
     # ── Agents ────────────────────────────────────────────────────────────────
-    def _render_agents(self, world: "World", camera: Camera, selected_id: int) -> None:
-        for a in world.agents:
+    def _draw_agents(self) -> None:
+        cam = self.camera
+        tw = config.TILE_WIDTH * cam.zoom
+        th = config.TILE_HEIGHT * cam.zoom
+        r = max(2, int(3 * cam.zoom))
+
+        for a in self.world.agents:
             if not a.alive:
                 continue
-            sx, sy = camera.tile_to_screen(a.x, a.y)
-            r = max(2, int(4 * camera.zoom))
-            cx, cy = int(sx + config.TILE_WIDTH * camera.zoom / 2), int(sy + config.TILE_HEIGHT * camera.zoom / 2)
+            sx, sy = cam.tile_to_screen(a.x, a.y)
+            cx = int(sx + tw / 2)
+            cy = int(sy + th / 2)
+            # shadow
             pygame.draw.circle(self.screen, (0, 0, 0), (cx, cy + 1), r + 1)
+            # body
             pygame.draw.circle(self.screen, a.color, (cx, cy), r)
             if a.is_police:
                 pygame.draw.circle(self.screen, (60, 90, 220), (cx, cy), r, 1)
-            if a.faction_id != -1 and a.faction_id in world.factions.factions:
-                fc = world.factions.factions[a.faction_id].color
+            if a.faction_id != -1 and a.faction_id in self.world.factions.factions:
+                fc = self.world.factions.factions[a.faction_id].color
                 pygame.draw.circle(self.screen, fc, (cx, cy), r + 1, 1)
-            if a.id == selected_id:
+            if a.id == self.selected_agent_id:
                 pygame.draw.circle(self.screen, (255, 255, 100), (cx, cy), r + 3, 1)
                 label = self.name_font.render(a.name, True, (255, 255, 200))
                 self.screen.blit(label, (cx - label.get_width() // 2, cy - r - 14))
@@ -137,11 +151,13 @@ class Renderer:
                 self.screen.blit(bubble, (cx + r + 2, cy - r - 8))
 
     # ── Tint ──────────────────────────────────────────────────────────────────
-    def _render_tint(self, world: "World") -> None:
-        r, g, b, a = tint_for_hour(world.time_system.hour_float)
+    def _draw_tint(self) -> None:
+        tint = tint_for_hour(self.world.time_system.hour)
+        if not tint or len(tint) < 4:
+            return
+        r, g, b, a = tint
         if a <= 0:
             return
-        overlay = pygame.Surface((self.screen.get_width(), self.screen.get_height()),
-                                 pygame.SRCALPHA)
-        overlay.fill((r, g, b, a))
+        overlay = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+        overlay.fill((int(r), int(g), int(b), int(a)))
         self.screen.blit(overlay, (0, 0))
