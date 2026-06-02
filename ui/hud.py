@@ -7,37 +7,80 @@ from __future__ import annotations
 import pygame
 from typing import TYPE_CHECKING
 
+import config
+
 if TYPE_CHECKING:
-from world.world import World
+    from world.world import World
 
 
 class HUD:
-def __init__(self) -> None:
-    self.font = pygame.font.SysFont("arial", 14, bold=True)
-    self.small = pygame.font.SysFont("arial", 12)
+    def __init__(self, screen: pygame.Surface, world: "World") -> None:
+        self.screen = screen
+        self.world = world
+        self.font = pygame.font.SysFont("arial", 14, bold=True)
+        self.small = pygame.font.SysFont("arial", 12)
+        self.llm_calls = 0
 
-def render(self, surf: pygame.Surface, world: "World", fps: float,
-           llm_calls: int = 0, paused: bool = False, speed: float = 1.0) -> None:
-    bar = pygame.Surface((surf.get_width(), 28), pygame.SRCALPHA)
-    bar.fill((0, 0, 0, 170))
-    surf.blit(bar, (0, 0))
+    def draw(
+        self,
+        paused: bool = False,
+        speed: float = 1.0,
+        sim_time=None,
+        population: int = 0,
+    ) -> None:
+        """Main draw entry-point used by main.py."""
+        surf = self.screen
+        world = self.world
+        bar = pygame.Surface((surf.get_width(), 28), pygame.SRCALPHA)
+        bar.fill((0, 0, 0, 170))
+        surf.blit(bar, (0, 0))
 
-    ts = world.time_system
-    alive = sum(1 for a in world.agents if a.alive)
-    dead = sum(1 for a in world.agents if not a.alive)
-    wanted = sum(1 for a in world.agents if a.alive and getattr(a, "wanted", False))
+        ts = sim_time if sim_time is not None else getattr(world, "time_system", None)
+        if ts is not None:
+            day = getattr(ts, "day", 0)
+            hour = getattr(ts, "hour", 0)
+            minute = getattr(ts, "minute", 0)
+            season = getattr(ts, "season_name", "")
+            time_str = f"День {day}  {hour:02d}:{minute:02d}  Сезон: {season}  "
+        else:
+            time_str = ""
 
-    line = (
-        f"День {ts.day}  {ts.hour:02d}:{ts.minute:02d}  "
-        f"Сезон: {ts.season_name}  "
-        f"Население: {alive}  Смерти: {dead}  Розыск: {wanted}  "
-        f"Группировки: {len(world.factions.factions)}  "
-        f"FPS: {fps:.0f}  LLM: {llm_calls}"
-    )
-    if paused:
-        line = "[ПАУЗА]  " + line
-    elif speed != 1.0:
-        line = f"[x{speed:.1f}]  " + line
+        alive = population if population else sum(
+            1 for a in getattr(world, "agents", []) if getattr(a, "alive", True)
+        )
+        dead = sum(1 for a in getattr(world, "agents", []) if not getattr(a, "alive", True))
+        wanted = sum(
+            1 for a in getattr(world, "agents", [])
+            if getattr(a, "alive", True) and getattr(a, "wanted", False)
+        )
+        factions = getattr(world, "factions", None)
+        n_factions = len(factions.factions) if factions and hasattr(factions, "factions") else 0
 
-    text = self.font.render(line, True, (240, 240, 240))
-    surf.blit(text, (8, 6))
+        line = (
+            f"{time_str}"
+            f"Население: {alive}  Смерти: {dead}  Розыск: {wanted}  "
+            f"Группировки: {n_factions}  "
+            f"LLM: {self.llm_calls}"
+        )
+        if paused:
+            line = "[ПАУЗА]  " + line
+        elif speed != 1.0:
+            line = f"[x{speed:.1f}]  " + line
+
+        text = self.font.render(line, True, (240, 240, 240))
+        surf.blit(text, (8, 6))
+
+    # Backwards-compat alias for older callers
+    def render(
+        self,
+        surf: pygame.Surface,
+        world: "World",
+        fps: float = 0.0,
+        llm_calls: int = 0,
+        paused: bool = False,
+        speed: float = 1.0,
+    ) -> None:
+        self.screen = surf
+        self.world = world
+        self.llm_calls = llm_calls
+        self.draw(paused=paused, speed=speed)
