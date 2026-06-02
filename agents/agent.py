@@ -1,0 +1,374 @@
+"""
+agent.py — A single citizen. Owns personality, needs, relationships, memory,
+current state, position, and the tick loop that translates utility-AI choices
+into concrete actions in the world.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, TYPE_CHECKING
+import random
+
+import config
+from agents.personality import Personality
+from agents.needs import Needs
+from agents.relationships import RelationshipBook
+from agents.memory import AgentMemory, MemoryEntry
+from agents.utility_ai import UtilityAI
+from agents.pathing import find_path
+from world.buildings import BuildingType
+from world.events import WorldEvent
+
+if TYPE_CHECKING:
+    from world.world import World
+    from world.buildings import Building
+
+
+RU_FIRST = (
+    "Алексей","Анна","Борис","Вера","Виктор","Галина","Дмитрий","Евгений",
+    "Екатерина","Иван","Игорь","Ирина","Константин","Лариса","Лев","Людмила",
+    "Максим","Марина","Наталья","Николай","Олег","Ольга","Павел","Полина",
+    "Роман","Светлана","Сергей","Татьяна","Юрий","Юлия","Андрей","Артём",
+    "Михаил","Зоя","Степан","Тимофей","Раиса","Фёдор","Тамара","Лидия",
+)
+RU_LAST = (
+    "Иванов","Петров","Сидоров","Кузнецов","Смирнов","Васильев","Попов",
+    "Соколов","Михайлов","Новиков","Фёдоров","Морозов","Волков","Алексеев",
+    "Лебедев","Семёнов","Егоров","Павлов","Козлов","Степанов","Николаев",
+    "Орлов","Андреев","Макаров","Никитин","Захаров","Зайцев","Соловьёв",
+)
+
+
+@dataclass
+class Agent:
+    id: int
+    name: str
+    age: int
+    home_id: int
+    workplace_id: int
+    personality: Personality
+    needs: Needs
+    relationships: RelationshipBook
+    memory: AgentMemory
+    x: int
+    y: int
+    target_x: int = -1
+    target_y: int = -1
+    path: List[Tuple[int, int]] = field(default_factory=list)
+    current_action: str = "wander"
+    action_progress: float = 0.0
+    color: Tuple[int, int, int] = (200, 200, 200)
+    faction_id: int = -1
+    is_police: bool = False
+    alive: bool = True
+    arrested_ticks: int = 0
+    sleep_ticks: int = 0
+    speech_cooldown: float = 0.0
+    last_dialogue: str = ""
+    last_thought: str = ""
+    interior_building: int = -1   # building id if inside
+
+    # ── Construction ──────────────────────────────────────────────────────────
+    @classmethod
+    def spawn(cls, aid: int, home: "Building", rng: random.Random, world: "World") -> "Agent":
+        name = f"{rng.choice(RU_FIRST)} {rng.choice(RU_LAST)}"
+        age = max(16, int(rng.gauss(35, 14)))
+        # Position at one of the home's perimeter tiles
+        x, y = cls._adjacent_walkable(home, world)
+        pers = Personality.random(rng)
+        col = (
+            min(255, max(60, int(rng.gauss(160, 40)))),
+            min(255, max(60, int(rng.gauss(160, 40)))),
+            min(255, max(60, int(rng.gauss(160, 40)))),
+        )
+        return cls(
+            id=aid, name=name, age=age,
+            home_id=home.id, workplace_id=-1,
+            personality=pers,
+            needs=Needs(money=rng.uniform(0, 80)),
+            relationships=RelationshipBook(),
+            memory=AgentMemory(),
+            x=x, y=y, color=col,
+        )
+
+    @staticmethod
+    def _adjacent_walkable(building, world: "World") -> Tuple[int, int]:
+        for dx in range(-1, building.w + 1):
+            for dy in range(-1, building.h + 1):
+                tx, ty = building.x + dx, building.y + dy
+                if not world.tile_map.in_bounds(tx, ty):
+                    continue
+                if world.tile_map.is_walkable(tx, ty):
+                    return tx, ty
+        return building.x, building.y
+
+    # ── Tick ──────────────────────────────────────────────────────────────────
+    def tick(self, dt: float, world: "World") -> None:
+        if not self.alive:
+            return
+
+        if self.arrested_ticks > 0:
+            self.arrested_ticks -= 1
+            return
+
+        # Convert dt seconds → in-game hours
+        game_hours = dt * config.TIME_SCALE / 3600.0
+        self.needs.decay(game_hours)
+        if self.speech_cooldown > 0:
+            self.speech_cooldown -= dt
+
+        # Sleeping? regenerate
+        if self.current_action == "sleep" and self.sleep_ticks > 0:
+            self.needs.energy = min(1.0, self.needs.energy + 0.20 * game_hours * 4)
+            self.sleep_ticks -= 1
+            return
+
+        # Pick a new action periodically
+        if self.action_progress <= 0.0:
+            self._choose_action(world)
+
+        self._execute(dt, world)
+        self.action_progress -= dt
+
+        if self.needs.is_dying():
+            self.die(world, reason="истощение")
+
+    def daily_tick(self, world: "World") -> None:
+        self.age += 1 / 365  # placeholder; aging is slow
+        # Try to find a workplace if missing
+        if self.workplace_id == -1:
+            for b in world.buildings.workplaces():
+                if len(b.workers) < b.capacity:
+                    b.workers.append(self.id)
+                    self.workplace_id = b.id
+                    if b.type == BuildingType.POLICE_STATION:
+                        self.is_police = True
+                    break
+
+    # ── Decision ──────────────────────────────────────────────────────────────
+    def _choose_action(self, world: "World") -> None:
+        action = UtilityAI.best_action(self, world)
+        # Optionally consult LLM (rare, high-importance situations)
+        if (world.decision_router is not None
+                and config.LLM_ENABLED
+                and world.decision_router.should_consult(self, world)):
+            override = world.decision_router.consult(self, world, action)
+            if override:
+                action = override
+
+        self.current_action = action
+        self.action_progress = config.ACTION_BASE_DURATION_SECONDS
+
+        # Set target tile based on action
+        self.path = []
+        self.target_x = -1
+        self.target_y = -1
+
+        if action == "eat" or action == "shop":
+            self._target_building(world, [BuildingType.SHOP])
+        elif action == "sleep" or action == "go_home":
+            self._target_building_by_id(world, self.home_id)
+        elif action == "work":
+            if self.workplace_id != -1:
+                self._target_building_by_id(world, self.workplace_id)
+        elif action == "drink_at_bar":
+            self._target_building(world, [BuildingType.BAR])
+        elif action == "pray":
+            self._target_building(world, [BuildingType.CHURCH])
+        elif action == "patrol":
+            self._wander_target(world)
+        elif action == "socialize":
+            self._wander_target(world)
+        elif action == "wander" or action == "flee":
+            self._wander_target(world)
+        elif action == "commit_crime":
+            self._wander_target(world)
+
+    def _target_building(self, world: "World", types: List[BuildingType]) -> None:
+        candidates = [b for b in world.buildings.buildings if b.type in types]
+        if not candidates:
+            self._wander_target(world)
+            return
+        target = min(candidates, key=lambda b: abs(b.x - self.x) + abs(b.y - self.y))
+        self._target_building_by_id(world, target.id)
+
+    def _target_building_by_id(self, world: "World", bid: int) -> None:
+        b = world.buildings.get(bid)
+        if b is None:
+            self._wander_target(world)
+            return
+        tx, ty = Agent._adjacent_walkable(b, world)
+        self.target_x, self.target_y = tx, ty
+        path = find_path(world.tile_map, (self.x, self.y), (tx, ty))
+        self.path = path[1:] if path else []
+
+    def _wander_target(self, world: "World") -> None:
+        for _ in range(10):
+            tx = self.x + world.rng.randint(-8, 8)
+            ty = self.y + world.rng.randint(-8, 8)
+            if world.tile_map.in_bounds(tx, ty) and world.tile_map.is_walkable(tx, ty):
+                path = find_path(world.tile_map, (self.x, self.y), (tx, ty))
+                if path:
+                    self.target_x, self.target_y = tx, ty
+                    self.path = path[1:]
+                    return
+
+    # ── Execution ─────────────────────────────────────────────────────────────
+    def _execute(self, dt: float, world: "World") -> None:
+        # Move along path
+        if self.path:
+            nx, ny = self.path[0]
+            if world.tile_map.is_walkable(nx, ny) or (nx, ny) == (self.target_x, self.target_y):
+                self.x, self.y = nx, ny
+                self.path.pop(0)
+            else:
+                # Re-path
+                p = find_path(world.tile_map, (self.x, self.y), (self.target_x, self.target_y))
+                self.path = p[1:] if p else []
+
+        arrived = (self.x == self.target_x and self.y == self.target_y) or not self.path
+
+        if not arrived:
+            return
+
+        # On arrival, execute action effect
+        if self.current_action == "eat":
+            if self.needs.money >= config.MEAL_PRICE:
+                self.needs.money -= config.MEAL_PRICE
+                self.needs.hunger = min(1.0, self.needs.hunger + 0.6)
+                world.economy.record_purchase("food", 1.0)
+
+        elif self.current_action == "sleep":
+            self.sleep_ticks = config.SLEEP_TICKS
+            self.interior_building = self.home_id
+
+        elif self.current_action == "work":
+            self.needs.money += config.WAGE_PER_SHIFT
+            self.needs.energy = max(0.0, self.needs.energy - 0.1)
+            self.needs.meaning = min(1.0, self.needs.meaning + 0.05)
+            world.economy.record_production("tool", 0.5)
+
+        elif self.current_action == "drink_at_bar":
+            if self.needs.money >= config.DRINK_PRICE:
+                self.needs.money -= config.DRINK_PRICE
+                self.needs.social = min(1.0, self.needs.social + 0.3)
+                self.needs.energy = max(0.0, self.needs.energy - 0.05)
+                self._try_socialize(world)
+
+        elif self.current_action == "socialize":
+            self._try_socialize(world)
+
+        elif self.current_action == "pray":
+            self.needs.meaning = min(1.0, self.needs.meaning + 0.4)
+            self.needs.safety = min(1.0, self.needs.safety + 0.1)
+
+        elif self.current_action == "shop":
+            if self.needs.money >= config.LUXURY_PRICE:
+                self.needs.money -= config.LUXURY_PRICE
+                self.needs.belonging = min(1.0, self.needs.belonging + 0.2)
+                world.economy.record_purchase("luxury", 1.0)
+
+        elif self.current_action == "commit_crime":
+            target = self._pick_crime_target(world)
+            world.crime.attempt_crime(self, world, kind="theft", target=target)
+
+        elif self.current_action == "patrol":
+            pass
+
+        elif self.current_action == "flee":
+            self.needs.safety = min(1.0, self.needs.safety + 0.05)
+
+        # Force re-decision next tick
+        self.action_progress = 0.0
+
+    def _try_socialize(self, world: "World") -> None:
+        nearby = [
+            a for a in world.agents
+            if a.alive and a.id != self.id
+            and abs(a.x - self.x) <= 2 and abs(a.y - self.y) <= 2
+        ]
+        if not nearby:
+            return
+        other = world.rng.choice(nearby)
+        delta = world.rng.uniform(-0.10, 0.25)
+        # Compatibility nudge
+        compat = 1.0 - abs(self.personality.agreeableness - other.personality.agreeableness)
+        delta += (compat - 0.5) * 0.10
+        self.relationships.adjust(other.id, delta)
+        other.relationships.adjust(self.id, delta * 0.8)
+        self.needs.social = min(1.0, self.needs.social + 0.15)
+        other.needs.social = min(1.0, other.needs.social + 0.10)
+        self.needs.belonging = min(1.0, self.needs.belonging + 0.05)
+
+        if delta > 0.20:
+            self.memory.remember(MemoryEntry(
+                kind="positive_social", text=f"Хорошо поговорил с {other.name}",
+                importance=0.4, other_id=other.id,
+            ))
+            world.events.post(WorldEvent(
+                kind="positive_social", actor_id=self.id, target_id=other.id,
+                location=(self.x, self.y), importance=0.25,
+                text=f"{self.name} и {other.name} подружились",
+            ))
+        elif delta < -0.05:
+            self.memory.remember(MemoryEntry(
+                kind="negative_social", text=f"Поссорился с {other.name}",
+                importance=0.5, other_id=other.id,
+            ))
+
+    def _pick_crime_target(self, world: "World"):
+        nearby = [
+            a for a in world.agents
+            if a.alive and a.id != self.id and not getattr(a, "is_police", False)
+            and abs(a.x - self.x) <= 3 and abs(a.y - self.y) <= 3
+        ]
+        if not nearby:
+            return None
+        return world.rng.choice(nearby)
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    def die(self, world: "World", reason: str) -> None:
+        self.alive = False
+        world.events.post(WorldEvent(
+            kind="death", actor_id=self.id, location=(self.x, self.y),
+            importance=0.9, text=f"{self.name} умер ({reason})",
+            payload={"reason": reason},
+        ))
+        # Free up housing/work slots
+        home = world.buildings.get(self.home_id)
+        if home and self.id in home.residents:
+            home.residents.remove(self.id)
+        if self.workplace_id != -1:
+            wp = world.buildings.get(self.workplace_id)
+            if wp and self.id in wp.workers:
+                wp.workers.remove(self.id)
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "name": self.name, "age": self.age,
+            "home": self.home_id, "work": self.workplace_id,
+            "personality": self.personality.to_dict(),
+            "needs": self.needs.to_dict(),
+            "rel": self.relationships.to_dict(),
+            "memory": self.memory.to_dict(),
+            "x": self.x, "y": self.y,
+            "color": list(self.color),
+            "faction": self.faction_id,
+            "police": self.is_police,
+            "alive": self.alive,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict, world: "World") -> "Agent":
+        a = cls(
+            id=d["id"], name=d["name"], age=d["age"],
+            home_id=d["home"], workplace_id=d["work"],
+            personality=Personality.from_dict(d["personality"]),
+            needs=Needs.from_dict(d["needs"]),
+            relationships=RelationshipBook.from_dict(d["rel"]),
+            memory=AgentMemory.from_dict(d["memory"]),
+            x=d["x"], y=d["y"], color=tuple(d["color"]),
+            faction_id=d["faction"], is_police=d["police"], alive=d["alive"],
+        )
+        return a
