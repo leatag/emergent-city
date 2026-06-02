@@ -67,6 +67,15 @@ class Agent:
     last_dialogue: str = ""
     last_thought: str = ""
     interior_building: int = -1   # building id if inside
+    # ── Movement (not persisted) ─────────────────────────────────────────────
+    # Accumulates dt × speed; an agent advances one tile every time this
+    # crosses 1.0. Decoupled from tick rate so visual speed is consistent.
+    _move_progress: float = 0.0
+    # Facing direction: "S" (down), "N" (up), "E" (right), "W" (left).
+    # Used by the renderer to flip/rotate the sprite.
+    facing: str = "S"
+    # Animation phase for stepping (renderer toggles between two leg poses).
+    _step_phase: float = 0.0
 
     # ── Construction ──────────────────────────────────────────────────────────
     @classmethod
@@ -123,11 +132,17 @@ class Agent:
             self.sleep_ticks -= 1
             return
 
-        # Pick a new action periodically
+        # Pick a new action when current one expires
         if self.action_progress <= 0.0:
             self._choose_action(world)
 
+        # Movement (rate-limited by AGENT_SPEED_TILES_PER_SECOND)
+        self._move(dt, world)
+
+        # On-arrival effects
         self._execute(dt, world)
+
+        # Tick down current action timer
         self.action_progress -= dt
 
         if self.needs.is_dying():
@@ -213,21 +228,49 @@ class Agent:
                     self.path = path[1:]
                     return
 
-    # ── Execution ─────────────────────────────────────────────────────────────
-    def _execute(self, dt: float, world: "World") -> None:
-        # Move along path
-        if self.path:
+    # ── Movement (rate-limited) ───────────────────────────────────────────────
+    def _move(self, dt: float, world: "World") -> None:
+        """Advance along path at AGENT_SPEED_TILES_PER_SECOND.
+
+        Independent of tick rate — accumulates dt × speed and steps only
+        when ≥ 1 tile of progress has built up. Updates `facing` for sprite
+        orientation and `_step_phase` for leg animation.
+        """
+        if not self.path:
+            self._step_phase = 0.0
+            return
+
+        # Accumulate progress this tick.
+        self._move_progress += dt * config.AGENT_SPEED_TILES_PER_SECOND
+
+        # Step as many tiles as we've earned (usually 0 or 1 per tick).
+        # Guard against runaway: at most 4 tiles per tick (huge dt spike).
+        steps = 0
+        while self._move_progress >= 1.0 and self.path and steps < 4:
             nx, ny = self.path[0]
             if world.tile_map.is_walkable(nx, ny) or (nx, ny) == (self.target_x, self.target_y):
+                # Update facing before moving.
+                if nx > self.x: self.facing = "E"
+                elif nx < self.x: self.facing = "W"
+                elif ny > self.y: self.facing = "S"
+                elif ny < self.y: self.facing = "N"
                 self.x, self.y = nx, ny
                 self.path.pop(0)
+                self._move_progress -= 1.0
+                steps += 1
+                self._step_phase += 0.5  # toggle leg pose
             else:
-                # Re-path
+                # Blocked — re-path and bail this tick.
                 p = find_path(world.tile_map, (self.x, self.y), (self.target_x, self.target_y))
                 self.path = p[1:] if p else []
+                self._move_progress = 0.0
+                return
 
-        arrived = (self.x == self.target_x and self.y == self.target_y) or not self.path
-
+    # ── Execution (on-arrival effects only) ───────────────────────────────────
+    def _execute(self, dt: float, world: "World") -> None:
+        arrived = (self.x == self.target_x and self.y == self.target_y) or (
+            self.target_x == -1 and not self.path
+        )
         if not arrived:
             return
 
@@ -357,6 +400,7 @@ class Agent:
             "faction": self.faction_id,
             "police": self.is_police,
             "alive": self.alive,
+            "facing": self.facing,
         }
 
     @classmethod
@@ -371,4 +415,5 @@ class Agent:
             x=d["x"], y=d["y"], color=tuple(d["color"]),
             faction_id=d["faction"], is_police=d["police"], alive=d["alive"],
         )
+        a.facing = d.get("facing", "S")
         return a
