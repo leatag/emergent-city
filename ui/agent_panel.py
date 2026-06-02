@@ -18,6 +18,13 @@ if TYPE_CHECKING:
     from rendering.camera import Camera
 
 
+# Click hit-test radius in tiles. Squared because we compare squared distances.
+# 5 tiles ≈ pretty generous; humans are small on screen and the cursor
+# rarely lands exactly on a 1-tile target.
+_CLICK_RADIUS_TILES = 5.0
+_CLICK_RADIUS_SQ = _CLICK_RADIUS_TILES * _CLICK_RADIUS_TILES
+
+
 class AgentPanel:
     WIDTH = 320
     PAD = 12
@@ -34,11 +41,20 @@ class AgentPanel:
 
     # ── Public API used by main.py ────────────────────────────────────────────
     def handle_click(self, pos: Tuple[int, int]) -> None:
-        """Open panel if an agent is under the click."""
-        tx, ty = self.camera.screen_to_tile(*pos)
-        # Find nearest living agent within 1 tile of the clicked tile.
+        """Open panel if an agent is under the click.
+
+        Uses precise float tile coordinates from the camera (not the
+        integer-truncated screen_to_tile_int), and a generous radius so
+        sparse, fast-moving agents are easy to grab.
+        """
+        # If the click is inside the panel itself, ignore (panel handles its own).
+        if self.is_open and pos[0] <= self.WIDTH:
+            return
+
+        tx, ty = self.camera.screen_to_tile(*pos)  # float coords
+
         best_id = -1
-        best_d = 1.5  # squared-tile distance threshold (sqrt ~ 1.22)
+        best_d = _CLICK_RADIUS_SQ
         for a in self.world.agents:
             if not a.alive:
                 continue
